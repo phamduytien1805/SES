@@ -7,6 +7,7 @@
     "thread": "cpp",
     "ostream": "cpp",
     "chrono": "cpp",
-    "condition_variable": "cpp"
+    "condition_variable": "cpp",
+    "future": "cpp"
   }
 }

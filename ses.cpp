@@ -8,7 +8,7 @@
 using namespace std;
 
 const int N = 3; // Number of processes
-const int M = 3; // Number of messages per process
+const int M = 2; // Number of messages per process
 const int T = 2; // Number of threads per process
 
 mutex mtx;
@@ -46,7 +46,7 @@ void process(int i) {
     for (int j = 0; j < N; j++) {
         if (j != i) {
             for (int k = 0; k < M; k++) {
-                send(i, j, k);
+                thread(send, i, j, k).detach();
             }
         }
     }
