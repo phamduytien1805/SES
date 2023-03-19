@@ -4,7 +4,11 @@
 #include <condition_variable>
 #include <vector>
 #include <stack>
-#include <queue>
+#include <deque>
+#include <random>
+#include <chrono>
+#include <fstream>
+#include <string>
 
 using namespace std;
 
@@ -15,13 +19,16 @@ struct Message
     vector<vector<int>> vector;
 };
 
-const int N = 2; // Number of processes
+const int N = 3; // Number of processes
 const int M = 2; // Number of messages per process
 const int T = 2; // Number of threads per process
 
 mutex mtx;
+vector<mutex> fileMutexes(N);
+
 condition_variable cv;
-vector<queue<Message>> buffers(N);
+vector<deque<Message>> msgQueue(N);
+vector<deque<Message>> buffers(N);
 vector<vector<vector<int>>> vector_P(N, vector<vector<int>>(N, vector<int>(N, 0)));
 vector<vector<int>> vectorClocks(N, vector<int>(N, 0));
 
@@ -56,31 +63,47 @@ void printCachedVector(vector<vector<int>> &v)
     }
     cout << " ]";
 }
-void receivedInfo(int processID, vector<int> localTime, Message msg, bool isBuffered = false)
+void receivedInfo(int processID, vector<int> localTime, vector<vector<int>> currentCachedVectors, Message &msg, bool isBuffered = false, bool isFromBuffered = false)
 {
+    cout << "##################" << endl;
+    cout << "Received:" << endl;
     if (isBuffered)
     {
         cout << "(Buffered message): ";
+    }
+    else if (isFromBuffered)
+    {
+        cout << "(Message From Buffer): ";
     }
     else
     {
         cout << "(Message): ";
     }
-    cout << "P" << processID << " <-- P" << msg.processID;
-    cout << "msg timestamp: ";
+    cout << "P" << processID << " <-- P" << msg.processID << endl;
+    cout << "Message timestamp: ";
     printLocalTime(msg.timestamp);
-    cout << " V_P" << msg.processID << ": ";
-    printCachedVector(msg.vector);
+    if (!isBuffered)
+    {
+        cout << "\nUpdated V_P" << processID << ": ";
+        printCachedVector(currentCachedVectors);
+    }
     cout << endl;
+    cout << "P" << processID << " received timestamp: ";
+    printLocalTime(localTime);
+    cout << endl;
+    cout << "##################" << endl;
 }
 void sendedInfo(int &sourcePID, int &destPID, Message &msg)
 {
+    cout << "##################" << endl;
+    cout << "Sended:" << endl;
     cout << "P" << sourcePID << " -> P" << destPID;
     cout << " local time: ";
     printLocalTime(msg.timestamp);
     cout << " V_P" << sourcePID << ": ";
     printCachedVector(msg.vector);
     cout << endl;
+    cout << "##################" << endl;
 }
 bool isLessThanOrEqual(int processId, vector<int> vectorInMsg, vector<int> localVectorClock)
 {
@@ -125,9 +148,22 @@ vector<int> mergeVector(const vector<int> &a, const vector<int> &b)
 void send(int sourcePID, int destPID)
 {
     unique_lock<mutex> lock(mtx);
+    // unique_lock<mutex> lock(fileMutexes[sourcePID]);
+    ofstream file(to_string(sourcePID) + ".txt", ios_base::app);
+
     vectorClocks[sourcePID][sourcePID]++;
     Message msg = {sourcePID, vectorClocks[sourcePID], vector_P[sourcePID]};
-    buffers[destPID].push(msg);
+
+    static thread_local std::mt19937 rng(std::random_device{}());
+    if (std::bernoulli_distribution{0.4}(rng) && !msgQueue[destPID].empty())
+    {
+        msgQueue[destPID].push_front(msg);
+    }
+    else
+    {
+        msgQueue[destPID].push_back(msg);
+    }
+    // msgQueue[destPID].push(msg);
     sendedInfo(sourcePID, destPID, msg);
     vector_P[sourcePID][destPID][sourcePID]++;
     // vector<vector<int>> cachedVector;
@@ -140,12 +176,14 @@ void receive(int receiverPID)
     while (true)
     {
         cv.wait(lock, [receiverPID]
-                { return !buffers[receiverPID].empty(); });
-        Message msg = buffers[receiverPID].front();
+                { return !msgQueue[receiverPID].empty(); });
+        Message msg = msgQueue[receiverPID].front();
 
         if (!isLessThanOrEqual(receiverPID, msg.vector[receiverPID], vectorClocks[receiverPID]))
         {
-            receivedInfo(receiverPID, vectorClocks[receiverPID], msg, true);
+            buffers[receiverPID].push_back(msg);
+            msgQueue[receiverPID].pop_front();
+            receivedInfo(receiverPID, vectorClocks[receiverPID], {{}}, msg, true);
             break;
         }
         vectorClocks[receiverPID][receiverPID]++;
@@ -154,13 +192,33 @@ void receive(int receiverPID)
 
         for (int j = 0; j < N; j++)
         {
-            mergeVector(vector_P[receiverPID][j], senderVector_P[j]);
+            if (j != receiverPID)
+            {
+                vector_P[receiverPID][j] = mergeVector(vector_P[receiverPID][j], senderVector_P[j]);
+            }
             vectorClocks[receiverPID][j] = max(vectorClocks[receiverPID][j], senderClock[j]);
         }
-        // vectorClocks[receiverPID][msg.processID] = max(vectorClocks[receiverPID][msg.processID], vectorClocks[msg.processID][msg.processID]);
-        receivedInfo(receiverPID, vectorClocks[receiverPID], msg);
-        buffers[receiverPID].pop();
-        // vectorClocks[i][i] = max(vectorClocks[i][i], vectorClocks[msg.first][i]);
+        receivedInfo(receiverPID, vectorClocks[receiverPID], vector_P[receiverPID], msg);
+        msgQueue[receiverPID].pop_front();
+        while (!buffers[receiverPID].empty())
+        {
+            Message msgBuffered = buffers[receiverPID].front();
+
+            if (!isLessThanOrEqual(receiverPID, msgBuffered.vector[receiverPID], vectorClocks[receiverPID]))
+            {
+                break;
+            }
+            vectorClocks[receiverPID][receiverPID]++;
+            auto senderBufferedClock = msgBuffered.timestamp;
+            auto senderBufferedVector_P = msgBuffered.vector;
+            for (int j = 0; j < N; j++)
+            {
+                vector_P[receiverPID][j] = mergeVector(vector_P[receiverPID][j], senderBufferedVector_P[j]);
+                vectorClocks[receiverPID][j] = max(vectorClocks[receiverPID][j], senderBufferedClock[j]);
+            }
+            receivedInfo(receiverPID, vectorClocks[receiverPID], vector_P[receiverPID], msg, false, true);
+            buffers[receiverPID].pop_front();
+        }
     }
 }
 void process(int i)
